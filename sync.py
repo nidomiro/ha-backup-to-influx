@@ -17,9 +17,10 @@ import argparse
 import json
 import os
 import sqlite3
+import sys
 from datetime import datetime, timezone
 
-from influxdb_client import InfluxDBClient
+from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
 
 # ── Konfiguration ────────────────────────────────────────────────────────────
@@ -46,46 +47,6 @@ IGNORE_ATTRIBUTES = {
     "state_class",
 }
 
-def escape_tag(v: str) -> str:
-    """Line-Protocol Tag-Escaping: Komma, Leerzeichen, Gleichheitszeichen."""
-    return str(v).replace(",", r"\,").replace(" ", r"\ ").replace("=", r"\=")
-
-def escape_measurement(v: str) -> str:
-    return str(v).replace(",", r"\,").replace(" ", r"\ ")
-
-def escape_field_key(v: str) -> str:
-    return str(v).replace(",", r"\,").replace(" ", r"\ ").replace("=", r"\=")
-
-def field_value(v) -> str | None:
-    """Konvertiert einen Python-Wert in einen InfluxDB Line-Protocol Field-Value-String."""
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, int):
-        return f"{v}i"
-    if isinstance(v, float):
-        return str(v)
-    if isinstance(v, str):
-        escaped = v.replace('"', r'\"').replace("\\", "\\\\")
-        return f'"{escaped}"'
-    return None
-
-def build_line(measurement: str, tags: dict, fields: dict, ts_ns: int) -> str | None:
-    if not fields:
-        return None
-    tag_str = ",".join(f"{escape_tag(k)}={escape_tag(v)}" for k, v in sorted(tags.items()))
-    field_parts = []
-    for k, v in fields.items():
-        fv = field_value(v)
-        if fv is not None:
-            field_parts.append(f"{escape_field_key(k)}={fv}")
-    if not field_parts:
-        return None
-    field_str = ",".join(field_parts)
-    m = escape_measurement(measurement)
-    if tag_str:
-        return f"{m},{tag_str} {field_str} {ts_ns}"
-    return f"{m} {field_str} {ts_ns}"
-
 # ── DB-Abfrage ───────────────────────────────────────────────────────────────
 
 QUERY = """
@@ -103,7 +64,7 @@ QUERY = """
     ORDER BY s.last_updated_ts
 """
 
-def fetch_rows(db_path: str, from_ts: float | None, to_ts: float | None):
+def iter_rows(db_path: str, from_ts: float | None, to_ts: float | None):
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
     conn.row_factory = sqlite3.Row
     clauses, params = [], []
@@ -116,13 +77,16 @@ def fetch_rows(db_path: str, from_ts: float | None, to_ts: float | None):
     q = QUERY.format(where_extra=" ".join(clauses))
     cur = conn.cursor()
     cur.execute(q, params)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+    try:
+        for row in cur:
+            yield row
+    finally:
+        cur.close()
+        conn.close()
 
 # ── Punkt-Konvertierung ──────────────────────────────────────────────────────
 
-def row_to_line(row, measurement_attr: str, extra_tags: dict) -> str | None:
+def row_to_point(row, measurement_attr: str, extra_tags: dict) -> Point | None:
     entity_id: str = row["entity_id"]           # z.B. "sensor.temperature_bedroom"
     domain, _, short_id = entity_id.partition(".")
     state: str = row["state"]
@@ -144,21 +108,25 @@ def row_to_line(row, measurement_attr: str, extra_tags: dict) -> str | None:
     else:
         measurement = attrs.get(measurement_attr) or entity_id
 
+    point = Point(measurement).time(ts_ns, write_precision=WritePrecision.NS)
+
     # ── Tags ─────────────────────────────────────────────────────────────────
-    tags = {
-        "domain":    domain,
-        "entity_id": short_id,
-        **extra_tags,
-    }
+    point.tag("domain", domain)
+    point.tag("entity_id", short_id)
+    for k, v in extra_tags.items():
+        point.tag(k, v)
 
     # ── Fields ───────────────────────────────────────────────────────────────
-    fields = {}
+    has_field = False
 
     # Primär-Wert: value (float) oder state (str)
     try:
-        fields["value"] = float(state)
+        point.field("value", float(state))
+        has_field = True
     except (ValueError, TypeError):
-        fields["state"] = state
+        if state is not None:
+            point.field("state", state)
+            has_field = True
 
     # Attribute als weitere Fields (wie die Integration es tut)
     for attr_key, attr_val in attrs.items():
@@ -167,15 +135,22 @@ def row_to_line(row, measurement_attr: str, extra_tags: dict) -> str | None:
         if isinstance(attr_val, (list, dict)):
             # Komplexe Typen überspringen (HA tut das auch)
             continue
-        fk = escape_field_key(attr_key)
-        # HA hängt _str an, wenn es einen nicht-string Wert als String speichert
         if isinstance(attr_val, str):
-            fields[attr_key] = attr_val
-        elif isinstance(attr_val, (int, float, bool)):
-            fields[attr_key] = attr_val
-            fields[f"{attr_key}_str"] = str(attr_val)
+            point.field(attr_key, attr_val)
+            has_field = True
+        elif isinstance(attr_val, bool):
+            # bool vor int prüfen, da bool eine int-Unterklasse ist
+            point.field(attr_key, attr_val)
+            point.field(f"{attr_key}_str", str(attr_val))
+            has_field = True
+        elif isinstance(attr_val, (int, float)):
+            point.field(attr_key, attr_val)
+            point.field(f"{attr_key}_str", str(attr_val))
+            has_field = True
 
-    return build_line(measurement, tags, fields, ts_ns)
+    if not has_field:
+        return None
+    return point
 
 # ── State-File ───────────────────────────────────────────────────────────────
 
@@ -186,9 +161,35 @@ def load_last_ts() -> float | None:
     return None
 
 def save_last_ts(ts: float):
-    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    parent = os.path.dirname(STATE_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
     with open(STATE_FILE, "w") as f:
         f.write(str(ts))
+
+# ── InfluxDB-Check ───────────────────────────────────────────────────────────
+
+def check_influx(client: InfluxDBClient, bucket: str):
+    """Verifiziert Erreichbarkeit, Auth und Bucket-Zugriff. Beendet bei Fehler."""
+    try:
+        if not client.ping():
+            print(f"FEHLER: InfluxDB unter {INFLUX_URL} nicht erreichbar (ping fehlgeschlagen).", file=sys.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(f"FEHLER: InfluxDB unter {INFLUX_URL} nicht erreichbar: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        b = client.buckets_api().find_bucket_by_name(bucket)
+    except Exception as e:
+        print(f"FEHLER: Bucket-Lookup fehlgeschlagen (Token/Org prüfen): {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if b is None:
+        print(f"FEHLER: Bucket '{bucket}' nicht gefunden in Org '{INFLUX_ORG}'.", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"InfluxDB OK: {INFLUX_URL}, Bucket '{bucket}' erreichbar.")
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 
@@ -222,23 +223,18 @@ def main():
         else:
             print("Kein STATE_FILE gefunden — exportiere alles (Erstlauf)")
 
-    rows = fetch_rows(HA_DB, from_ts, to_ts)
-    print(f"{len(rows)} Zeilen aus HA-DB geladen")
-
-    if not rows:
-        print("Nichts zu exportieren.")
-        return
-
     client = InfluxDBClient(url=INFLUX_URL, token=INFLUX_TOKEN, org=INFLUX_ORG)
+    if not args.dry_run:
+        check_influx(client, INFLUX_BUCKET)
     write_api = client.write_api(write_options=SYNCHRONOUS)
 
     batch, written, skipped = [], 0, 0
     max_ts = from_ts or 0.0
 
-    for row in rows:
-        line = row_to_line(row, args.measurement_attr, extra_tags)
-        if line:
-            batch.append(line)
+    for row in iter_rows(HA_DB, from_ts, to_ts):
+        point = row_to_point(row, args.measurement_attr, extra_tags)
+        if point is not None:
+            batch.append(point)
             written += 1
         else:
             skipped += 1
@@ -249,7 +245,8 @@ def main():
 
         if len(batch) >= BATCH_SIZE:
             if not args.dry_run:
-                write_api.write(bucket=INFLUX_BUCKET, record=batch)
+                write_api.write(bucket=INFLUX_BUCKET, record=batch,
+                                write_precision=WritePrecision.NS)
             else:
                 print(f"[dry-run] würde {len(batch)} Punkte schreiben")
             batch = []
@@ -257,7 +254,8 @@ def main():
 
     if batch:
         if not args.dry_run:
-            write_api.write(bucket=INFLUX_BUCKET, record=batch)
+            write_api.write(bucket=INFLUX_BUCKET, record=batch,
+                            write_precision=WritePrecision.NS)
         else:
             print(f"[dry-run] würde {len(batch)} Punkte schreiben")
 
@@ -265,6 +263,9 @@ def main():
         save_last_ts(max_ts)
 
     client.close()
+    if written == 0 and skipped == 0:
+        print("Nichts zu exportieren.")
+        return
     print(f"Fertig. Geschrieben: {written}, Übersprungen: {skipped}")
     print(f"Letzter exportierter Timestamp: {datetime.fromtimestamp(max_ts, tz=timezone.utc).isoformat()}")
 

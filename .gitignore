@@ -1,1 +1,6 @@
 home-assistant_v2.db
+.venv/
+last_export_ts.txt
+__pycache__/
+home-assistant_v2.db-shm
+home-assistant_v2.db-wal
