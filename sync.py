@@ -15,22 +15,26 @@ Inkrementell: STATE_FILE speichert den letzten exportierten Timestamp.
 
 import argparse
 import json
+import math
 import os
+import re
 import sqlite3
 import sys
 from datetime import datetime, timezone
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
+from influxdb_client.rest import ApiException
 
 # ── Konfiguration ────────────────────────────────────────────────────────────
 
 INFLUX_URL    = os.getenv("INFLUX_URL",    "https://influxdb.hl443.de")
 INFLUX_TOKEN  = os.getenv("INFLUX_TOKEN",  "")
 INFLUX_ORG    = os.getenv("INFLUX_ORG",    "d15e4819fb951381")
-INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "homeassistant")
+INFLUX_BUCKET = os.getenv("INFLUX_BUCKET", "homeassistant_2")
 HA_DB         = os.getenv("HA_DB",         "./home-assistant_v2.db")
 STATE_FILE    = os.getenv("STATE_FILE",    "./last_export_ts.txt")
+CONFLICTS_FILE = os.getenv("CONFLICTS_FILE", "./conflicts.log")
 
 # Entspricht measurement_attr: unit_of_measurement (HA-Default)
 # Auf "entity_id" setzen wenn du measurement_attr: entity_id verwendest
@@ -40,12 +44,24 @@ BATCH_SIZE = 5000
 
 # ── Hilfsfunktionen ──────────────────────────────────────────────────────────
 
-# Attribute die HA intern ignoriert / nicht schreibt
-IGNORE_ATTRIBUTES = {
-    "unit_of_measurement", "friendly_name", "icon", "entity_picture",
-    "supported_features", "hidden", "assumed_state", "device_class",
-    "state_class",
-}
+# 1:1 wie homeassistant/components/influxdb (default: include_uom=False, include_dc=False)
+IGNORE_ATTRIBUTES = {"unit_of_measurement", "device_class"}
+
+# Aus homeassistant/components/influxdb/const.py
+RE_DIGIT_TAIL = re.compile(r"^[^\.]*\d+\.?\d+[^\.]*$")
+RE_DECIMAL = re.compile(r"[^\d.]+")
+
+# Aus homeassistant/helpers/state.py:state_as_number
+_STATE_ON_LIKE  = {"on", "locked", "above_horizon", "open", "home"}
+_STATE_OFF_LIKE = {"off", "unlocked", "unknown", "below_horizon", "closed", "not_home"}
+
+def _state_as_number(state: str) -> float:
+    """Replikat von homeassistant.helpers.state.state_as_number."""
+    if state in _STATE_ON_LIKE:
+        return 1.0
+    if state in _STATE_OFF_LIKE:
+        return 0.0
+    return float(state)  # ValueError wenn nicht parsebar
 
 # ── DB-Abfrage ───────────────────────────────────────────────────────────────
 
@@ -87,9 +103,12 @@ def iter_rows(db_path: str, from_ts: float | None, to_ts: float | None):
 # ── Punkt-Konvertierung ──────────────────────────────────────────────────────
 
 def row_to_point(row, measurement_attr: str, extra_tags: dict) -> Point | None:
+    """1:1-Port von homeassistant/components/influxdb event_to_json.
+    Siehe https://github.com/home-assistant/core/blob/dev/homeassistant/components/influxdb/__init__.py
+    """
     entity_id: str = row["entity_id"]           # z.B. "sensor.temperature_bedroom"
     domain, _, short_id = entity_id.partition(".")
-    state: str = row["state"]
+    state = row["state"]
     ts_ns = int(float(row["last_updated_ts"]) * 1e9)
 
     attrs = {}
@@ -99,57 +118,63 @@ def row_to_point(row, measurement_attr: str, extra_tags: dict) -> Point | None:
         except (json.JSONDecodeError, TypeError):
             pass
 
-    # ── Measurement bestimmen ────────────────────────────────────────────────
+    # ── Measurement bestimmen (analog HA: unit_of_measurement → entity_id-Fallback)
     if measurement_attr == "unit_of_measurement":
-        uom = attrs.get("unit_of_measurement", "").strip()
-        measurement = uom if uom else entity_id
+        uom = attrs.get("unit_of_measurement")
+        measurement = uom if isinstance(uom, str) and uom.strip() else entity_id
     elif measurement_attr == "entity_id":
         measurement = entity_id
     else:
         measurement = attrs.get(measurement_attr) or entity_id
 
-    point = Point(measurement).time(ts_ns, write_precision=WritePrecision.NS)
+    # ── State → fields["value"] / fields["state"] (HA event_to_json) ─────────
+    fields: dict[str, float | str] = {}
+    try:
+        fields["value"] = float(state)
+    except (ValueError, TypeError):
+        try:
+            fields["value"] = float(_state_as_number(state))
+            fields["state"] = state
+        except (ValueError, TypeError):
+            if state is not None:
+                fields["state"] = state
 
-    # ── Tags ─────────────────────────────────────────────────────────────────
+    # ── Attribute → fields (HA event_to_json) ────────────────────────────────
+    for key, value in attrs.items():
+        if key in IGNORE_ATTRIBUTES:
+            continue
+        # Kollision: wenn Key schon belegt (z.B. Attribut "state" oder "value"),
+        # hängt HA einen Underscore an.
+        if key in fields:
+            key = f"{key}_"
+
+        try:
+            fields[key] = float(value)
+        except (ValueError, TypeError):
+            new_key = f"{key}_str"
+            new_value = str(value)
+            fields[new_key] = new_value
+            if RE_DIGIT_TAIL.match(new_value):
+                try:
+                    fields[key] = float(RE_DECIMAL.sub("", new_value))
+                except ValueError:
+                    pass
+
+        # NaN/Infinity raus (HA macht das auch)
+        v = fields.get(key)
+        if isinstance(v, float) and not math.isfinite(v):
+            del fields[key]
+
+    if not fields:
+        return None
+
+    point = Point(measurement).time(ts_ns, write_precision=WritePrecision.NS)
     point.tag("domain", domain)
     point.tag("entity_id", short_id)
     for k, v in extra_tags.items():
         point.tag(k, v)
-
-    # ── Fields ───────────────────────────────────────────────────────────────
-    has_field = False
-
-    # Primär-Wert: value (float) oder state (str)
-    try:
-        point.field("value", float(state))
-        has_field = True
-    except (ValueError, TypeError):
-        if state is not None:
-            point.field("state", state)
-            has_field = True
-
-    # Attribute als weitere Fields (wie die Integration es tut)
-    for attr_key, attr_val in attrs.items():
-        if attr_key in IGNORE_ATTRIBUTES:
-            continue
-        if isinstance(attr_val, (list, dict)):
-            # Komplexe Typen überspringen (HA tut das auch)
-            continue
-        if isinstance(attr_val, str):
-            point.field(attr_key, attr_val)
-            has_field = True
-        elif isinstance(attr_val, bool):
-            # bool vor int prüfen, da bool eine int-Unterklasse ist
-            point.field(attr_key, attr_val)
-            point.field(f"{attr_key}_str", str(attr_val))
-            has_field = True
-        elif isinstance(attr_val, (int, float)):
-            point.field(attr_key, attr_val)
-            point.field(f"{attr_key}_str", str(attr_val))
-            has_field = True
-
-    if not has_field:
-        return None
+    for k, v in fields.items():
+        point.field(k, v)
     return point
 
 # ── State-File ───────────────────────────────────────────────────────────────
@@ -191,6 +216,42 @@ def check_influx(client: InfluxDBClient, bucket: str):
 
     print(f"InfluxDB OK: {INFLUX_URL}, Bucket '{bucket}' erreichbar.")
 
+# ── Batch-Flush mit Konflikt-Logging ─────────────────────────────────────────
+
+def flush_batch(write_api, bucket: str, batch: list[tuple[Point, float]],
+                dry_run: bool, conflicts_path: str) -> tuple[int, float | None]:
+    """Schreibt batch nach Influx. Bei Fehler: Batch als Line-Protocol nach
+    conflicts_path schreiben, Fehler ausgeben und Programm beenden.
+
+    Returns (written_count, batch_max_ts_or_None).
+    """
+    if not batch:
+        return 0, None
+    batch_max_ts = max(ts for _, ts in batch)
+
+    if dry_run:
+        print(f"[dry-run] würde {len(batch)} Punkte schreiben")
+        return len(batch), batch_max_ts
+
+    try:
+        write_api.write(bucket=bucket, record=[p for p, _ in batch],
+                        write_precision=WritePrecision.NS)
+        return len(batch), batch_max_ts
+    except ApiException as e:
+        body = (e.body or "").strip()
+        ts_min = min(ts for _, ts in batch)
+        ts_max = batch_max_ts
+        print(f"FEHLER: Batch-Write fehlgeschlagen ({e.status}): {body}", file=sys.stderr)
+        print(f"  Batch: {len(batch)} Punkte, ts={ts_min} .. {ts_max}", file=sys.stderr)
+        with open(conflicts_path, "a") as log:
+            log.write(f"# {datetime.now(timezone.utc).isoformat()} batch failure status={e.status} body={body}\n")
+            for point, ts in batch:
+                log.write(point.to_line_protocol() + "\n")
+        print(f"  Batch-Daten ({len(batch)} Zeilen) nach {conflicts_path} geschrieben.", file=sys.stderr)
+        print("Abbruch. STATE_FILE steht auf dem letzten erfolgreich geschriebenen Timestamp; "
+              "nach dem Bereinigen einfach neu starten.", file=sys.stderr)
+        sys.exit(1)
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -228,46 +289,45 @@ def main():
         check_influx(client, INFLUX_BUCKET)
     write_api = client.write_api(write_options=SYNCHRONOUS)
 
-    batch, written, skipped = [], 0, 0
-    max_ts = from_ts or 0.0
+    batch: list[tuple[Point, float]] = []
+    written, skipped = 0, 0
+    last_seen_ts = from_ts or 0.0
+    last_written_ts = from_ts or 0.0
+
+    def do_flush():
+        nonlocal written, last_written_ts
+        ok, _ = flush_batch(write_api, INFLUX_BUCKET, batch, args.dry_run, CONFLICTS_FILE)
+        written += ok
+        # Erfolg: alle Rows bis last_seen_ts sind durch (auch übersprungene).
+        if last_seen_ts > last_written_ts:
+            last_written_ts = last_seen_ts
+            if not args.dry_run:
+                save_last_ts(last_written_ts)
+        batch.clear()
+        print(f"  {written} geschrieben, {skipped} übersprungen")
 
     for row in iter_rows(HA_DB, from_ts, to_ts):
         point = row_to_point(row, args.measurement_attr, extra_tags)
+        ts = float(row["last_updated_ts"])
+        last_seen_ts = ts  # iter_rows liefert nach ts sortiert
         if point is not None:
-            batch.append(point)
-            written += 1
+            batch.append((point, ts))
         else:
             skipped += 1
 
-        ts = float(row["last_updated_ts"])
-        if ts > max_ts:
-            max_ts = ts
-
         if len(batch) >= BATCH_SIZE:
-            if not args.dry_run:
-                write_api.write(bucket=INFLUX_BUCKET, record=batch,
-                                write_precision=WritePrecision.NS)
-            else:
-                print(f"[dry-run] würde {len(batch)} Punkte schreiben")
-            batch = []
-            print(f"  {written} Punkte geschrieben...")
+            do_flush()
 
     if batch:
-        if not args.dry_run:
-            write_api.write(bucket=INFLUX_BUCKET, record=batch,
-                            write_precision=WritePrecision.NS)
-        else:
-            print(f"[dry-run] würde {len(batch)} Punkte schreiben")
-
-    if not args.dry_run and max_ts > 0:
-        save_last_ts(max_ts)
+        do_flush()
 
     client.close()
     if written == 0 and skipped == 0:
         print("Nichts zu exportieren.")
         return
     print(f"Fertig. Geschrieben: {written}, Übersprungen: {skipped}")
-    print(f"Letzter exportierter Timestamp: {datetime.fromtimestamp(max_ts, tz=timezone.utc).isoformat()}")
+    if last_written_ts > 0:
+        print(f"Letzter geschriebener Timestamp: {datetime.fromtimestamp(last_written_ts, tz=timezone.utc).isoformat()}")
 
 if __name__ == "__main__":
     main()
