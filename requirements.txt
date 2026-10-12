@@ -1,1 +1,2 @@
 influxdb-client>=1.50,<2
+securetar>=2026.10

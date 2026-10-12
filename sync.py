@@ -11,8 +11,16 @@ Timestamp:    last_updated_ts in ns UTC
 
 Idempotent: InfluxDB 2 überschreibt identische (measurement, tags, timestamp)-Kombis.
 Inkrementell: STATE_FILE speichert den letzten exportierten Timestamp.
+Backup:       --backup <backup.tar> liest die DB direkt aus einem HA-Backup
+              (verschlüsselt: Schlüssel in HA_BACKUP_PASSWORD).
 """
 
+import contextlib
+from pathlib import Path
+import atexit
+import shutil
+import tarfile
+import tempfile
 import argparse
 import json
 import math
@@ -41,6 +49,72 @@ CONFLICTS_FILE = os.getenv("CONFLICTS_FILE", "./conflicts.log")
 MEASUREMENT_ATTR = os.getenv("MEASUREMENT_ATTR", "unit_of_measurement")
 
 BATCH_SIZE = 5000
+
+# ── HA-Backup (.tar) ─────────────────────────────────────────────────────────
+
+BACKUP_PASSWORD = os.getenv("HA_BACKUP_PASSWORD", "")
+BACKUP_INNER = "homeassistant.tar.gz"
+SECURETAR_MAGIC = b"SecureTar"
+DB_NAME = "home-assistant_v2.db"
+
+@contextlib.contextmanager
+def _open_inner_tar(backup_path: str):
+    """Öffnet homeassistant.tar.gz aus dem Backup als Stream-Tarfile (r|gz).
+
+    Verschlüsselte Backups (SecureTar) werden on-the-fly entschlüsselt.
+    """
+    with tarfile.open(backup_path, "r:") as outer:
+        try:
+            inner = outer.getmember(BACKUP_INNER)
+        except KeyError:
+            sys.exit(f"FEHLER: {BACKUP_INNER} nicht in {backup_path} "
+                     f"(kein Core-Backup?). Enthalten: {outer.getnames()}")
+        raw = outer.extractfile(inner)
+        encrypted = raw.read(len(SECURETAR_MAGIC)) == SECURETAR_MAGIC
+        raw.seek(0)
+        print(f"Lese {DB_NAME} aus {backup_path} "
+              f"({'verschlüsselt' if encrypted else 'unverschlüsselt'}) …")
+
+        if not encrypted:
+            with tarfile.open(fileobj=raw, mode="r|gz") as inner_tar:
+                yield inner_tar
+            return
+
+        if not BACKUP_PASSWORD:
+            sys.exit("FEHLER: Backup ist verschlüsselt – HA_BACKUP_PASSWORD setzen "
+                     "(Backup-Schlüssel aus den HA-Backup-Einstellungen).")
+        try:
+            from securetar import SecureTarArchive, SecureTarError
+        except ImportError:
+            sys.exit("FEHLER: 'securetar' fehlt (pip install -r requirements.txt)")
+        try:
+            with SecureTarArchive(Path(backup_path), "r", password=BACKUP_PASSWORD) as archive:
+                with archive.extract_tar(archive.tar.getmember(BACKUP_INNER)) as reader, \
+                        tarfile.open(fileobj=reader, mode="r|gz") as inner_tar:
+                    yield inner_tar
+        except SecureTarError as e:
+            sys.exit(f"FEHLER: Entschlüsselung fehlgeschlagen (Passwort prüfen): {e}")
+
+def extract_db_from_backup(backup_path: str, workdir: str) -> str:
+    """Streamt data/home-assistant_v2.db (+ -wal) aus einem HA-Backup nach workdir.
+
+    Das äußere Tar ist seekbar (nur homeassistant.tar.gz wird gelesen, Add-ons
+    werden übersprungen). Das innere Archiv wird gestreamt – nie komplett im RAM.
+    """
+    wanted = {f"data/{DB_NAME}": DB_NAME, f"data/{DB_NAME}-wal": f"{DB_NAME}-wal"}
+    found = set()
+    with _open_inner_tar(backup_path) as inner_tar:
+        for member in inner_tar:
+            name = member.name.removeprefix("./")
+            if name not in wanted or not member.isfile():
+                continue
+            print(f"  extrahiere {name} ({member.size / 1e9:.1f} GB)")
+            with open(os.path.join(workdir, wanted[name]), "wb") as out:
+                shutil.copyfileobj(inner_tar.extractfile(member), out, length=8 << 20)
+            found.add(wanted[name])
+    if DB_NAME not in found:
+        sys.exit(f"FEHLER: data/{DB_NAME} nicht in {BACKUP_INNER} gefunden.")
+    return os.path.join(workdir, DB_NAME)
 
 # ── Hilfsfunktionen ──────────────────────────────────────────────────────────
 
@@ -260,6 +334,9 @@ def main():
     parser.add_argument("--to-ts",     type=float, help="Unix-Timestamp (Sekunden) bis zu dem exportiert wird")
     parser.add_argument("--full",      action="store_true", help="Ignoriert STATE_FILE, exportiert alles")
     parser.add_argument("--dry-run",   action="store_true", help="Kein Schreiben nach InfluxDB")
+    parser.add_argument("--backup",    metavar="TAR",
+                        help="HA-Backup (.tar, ggf. verschlüsselt, Passwort in HA_BACKUP_PASSWORD); "
+                             "home-assistant_v2.db wird daraus in ein Temp-Verzeichnis extrahiert")
     parser.add_argument("--tag",       action="append", default=[], metavar="KEY=VALUE",
                         help="Zusätzliche Tags (z.B. --tag source=HA)")
     parser.add_argument("--measurement-attr", default=MEASUREMENT_ATTR,
@@ -306,7 +383,13 @@ def main():
         batch.clear()
         print(f"  {written} geschrieben, {skipped} übersprungen")
 
-    for row in iter_rows(HA_DB, from_ts, to_ts):
+    db_path = HA_DB
+    if args.backup:
+        tmp = tempfile.TemporaryDirectory(prefix=".ha-extract-", dir=".")
+        atexit.register(tmp.cleanup)
+        db_path = extract_db_from_backup(args.backup, tmp.name)
+
+    for row in iter_rows(db_path, from_ts, to_ts):
         point = row_to_point(row, args.measurement_attr, extra_tags)
         ts = float(row["last_updated_ts"])
         last_seen_ts = ts  # iter_rows liefert nach ts sortiert
