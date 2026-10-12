@@ -1,0 +1,31 @@
+[tools]
+python = "3"
+
+[env]
+_.file = { path = ".env", redact = true }
+_.python.venv = { path = ".venv", create = true }
+
+[tasks.install]
+description = "Install Python dependencies into .venv"
+run = "pip install -r requirements.txt"
+sources = ["requirements.txt"]
+
+[tasks.sync]
+description = "Incremental export HA SQLite -> InfluxDB (extra args are passed through)"
+depends = ["install"]
+run = "python sync.py"
+
+[tasks.dry-run]
+description = "Export without writing to InfluxDB"
+depends = ["install"]
+run = "python sync.py --dry-run"
+
+[tasks.full]
+description = "Full export, ignoring STATE_FILE"
+depends = ["install"]
+run = "python sync.py --full"
+
+[tasks.backup]
+description = "Export from an HA backup .tar (usage: mise run backup <file.tar>; key in HA_BACKUP_PASSWORD)"
+depends = ["install"]
+run = 'python sync.py --backup "$@"'
