@@ -29,3 +29,27 @@ run = "python sync.py --full"
 description = "Export from an HA backup .tar (usage: mise run backup <file.tar>; key in HA_BACKUP_PASSWORD)"
 depends = ["install"]
 run = 'python sync.py --backup "$@"'
+
+[tasks.install-dev]
+description = "Install runtime + dev dependencies"
+run = "pip install -r requirements-dev.txt"
+sources = ["requirements.txt", "requirements-dev.txt"]
+
+[tasks.lint]
+description = "ruff"
+depends = ["install-dev"]
+run = "ruff check ."
+
+[tasks.typecheck]
+description = "mypy"
+depends = ["install-dev"]
+run = "mypy sync.py"
+
+[tasks.test]
+description = "pytest"
+depends = ["install-dev"]
+run = "pytest -q"
+
+[tasks.check]
+description = "lint + typecheck + test (used by CI)"
+depends = ["lint", "typecheck", "test"]

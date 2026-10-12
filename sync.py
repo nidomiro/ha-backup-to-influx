@@ -15,20 +15,21 @@ Backup:       --backup <backup.tar> liest die DB direkt aus einem HA-Backup
               (verschlüsselt: Schlüssel in HA_BACKUP_PASSWORD).
 """
 
-import contextlib
-from pathlib import Path
-import atexit
-import shutil
-import tarfile
-import tempfile
 import argparse
+import atexit
+import contextlib
 import json
 import math
 import os
 import re
+import shutil
 import sqlite3
 import sys
+import tarfile
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, cast
 
 from influxdb_client import InfluxDBClient, Point, WritePrecision
 from influxdb_client.client.write_api import SYNCHRONOUS
@@ -70,6 +71,8 @@ def _open_inner_tar(backup_path: str):
             sys.exit(f"FEHLER: {BACKUP_INNER} nicht in {backup_path} "
                      f"(kein Core-Backup?). Enthalten: {outer.getnames()}")
         raw = outer.extractfile(inner)
+        if raw is None:
+            sys.exit(f"FEHLER: {BACKUP_INNER} in {backup_path} ist keine reguläre Datei.")
         encrypted = raw.read(len(SECURETAR_MAGIC)) == SECURETAR_MAGIC
         raw.seek(0)
         print(f"Lese {DB_NAME} aus {backup_path} "
@@ -90,7 +93,7 @@ def _open_inner_tar(backup_path: str):
         try:
             with SecureTarArchive(Path(backup_path), "r", password=BACKUP_PASSWORD) as archive:
                 with archive.extract_tar(archive.tar.getmember(BACKUP_INNER)) as reader, \
-                        tarfile.open(fileobj=reader, mode="r|gz") as inner_tar:
+                        tarfile.open(fileobj=cast(Any, reader), mode="r|gz") as inner_tar:
                     yield inner_tar
         except SecureTarError as e:
             sys.exit(f"FEHLER: Entschlüsselung fehlgeschlagen (Passwort prüfen): {e}")
@@ -319,7 +322,7 @@ def flush_batch(write_api, bucket: str, batch: list[tuple[Point, float]],
         print(f"  Batch: {len(batch)} Punkte, ts={ts_min} .. {ts_max}", file=sys.stderr)
         with open(conflicts_path, "a") as log:
             log.write(f"# {datetime.now(timezone.utc).isoformat()} batch failure status={e.status} body={body}\n")
-            for point, ts in batch:
+            for point, _ts in batch:
                 log.write(point.to_line_protocol() + "\n")
         print(f"  Batch-Daten ({len(batch)} Zeilen) nach {conflicts_path} geschrieben.", file=sys.stderr)
         print("Abbruch. STATE_FILE steht auf dem letzten erfolgreich geschriebenen Timestamp; "
@@ -410,7 +413,8 @@ def main():
         return
     print(f"Fertig. Geschrieben: {written}, Übersprungen: {skipped}")
     if last_written_ts > 0:
-        print(f"Letzter geschriebener Timestamp: {datetime.fromtimestamp(last_written_ts, tz=timezone.utc).isoformat()}")
+        last_dt = datetime.fromtimestamp(last_written_ts, tz=timezone.utc)
+        print(f"Letzter geschriebener Timestamp: {last_dt.isoformat()}")
 
 if __name__ == "__main__":
     main()
